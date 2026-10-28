@@ -111,3 +111,7 @@ The access point and the scan share one radio. Clients can stall for a few secon
 - Form text is length-limited and control characters are dropped.
 - A scan is refused if free heap is under 24 KB.
 - If the access point cannot start, the web server is left down and the LED blinks. `delay` in that path still feeds the watchdog.
+
+## License
+
+This project is released under the MIT License. The author and copyright holder is Umid Guluzada. The full text is in [LICENSE](LICENSE).

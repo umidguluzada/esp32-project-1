@@ -9,7 +9,7 @@ No extra parts. Power the board from USB.
 - A password-protected Wi-Fi network named `ESP32-EduLab`.
 - A phone or laptop that joins it is offered this board as its DNS server, and current phones also receive the DHCP captive-portal address.
 - Opening an ordinary `http://` address, or `http://192.168.4.1/`, shows the dashboard.
-- The page reports free heap, lowest free heap, uptime, and how many clients are joined.
+- The page reports free heap, lowest free heap, and uptime. It does not list who is joined.
 - **Scan networks** listens for nearby access points and lists SSID, RSSI, channel, and encryption. The board does not join them.
 - The form stores a label, a note, and the LED state in RAM on the ESP32 and prints them on the serial port. Rebooting clears them.
 
@@ -30,9 +30,9 @@ These ship with the ESP32 Arduino core. Do not install Library Manager copies, a
 | File | Purpose |
 | --- | --- |
 | `ESP32_Educational_WiFi_Lab/ESP32_Educational_WiFi_Lab.ino` | `setup` / `loop` |
-| `ESP32_Educational_WiFi_Lab/config.h` | SSID, password, channel, LED pin |
-| `ESP32_Educational_WiFi_Lab/firmware.cpp` | Access point, DNS, web server, scan, form |
-| `ESP32_Educational_WiFi_Lab/portal_html.h` | Dashboard stored in flash |
+| `ESP32_Educational_WiFi_Lab/config.h` | SSID, Wi-Fi password, admin login, channel, LED pin |
+| `ESP32_Educational_WiFi_Lab/firmware.cpp` | Access point, DNS, web server, scan, form, admin auth |
+| `ESP32_Educational_WiFi_Lab/portal_html.h` | Public dashboard and separate admin page, both stored in flash |
 | `platformio.ini` | PlatformIO build for the ESP32 Dev Module |
 
 Change the name and password in `config.h` before a classroom session. The password must be 8 to 63 characters.
@@ -83,7 +83,7 @@ This project path contains a `#`. If PlatformIO misreads the path, copy the proj
 2. Turn off mobile data for the test so the browser uses the ESP32 Wi-Fi network.
 3. Wait for the sign-in or captive-portal popup, or open `http://192.168.4.1/`.
 4. A plain HTTP check such as `http://neverssl.com/` should also land on the dashboard. The phone still has to be joined to this access point.
-5. Read heap, uptime, and the client count. Watch the serial monitor while a device joins.
+5. Read heap and uptime. Client addresses are not on this page. Watch the serial monitor, or the admin page below, while a device joins.
 6. Press **Scan networks**. The table fills when the scan finishes.
 7. Save a label and a note. The preview and the serial line `[config]` show the text stored on the board. **Clear** restores the default label.
 
@@ -111,6 +111,24 @@ The access point and the scan share one radio. Clients can stall for a few secon
 - Form text is length-limited and control characters are dropped.
 - A scan is refused if free heap is under 24 KB.
 - If the access point cannot start, the web server is left down and the LED blinks. `delay` in that path still feeds the watchdog.
+
+## Admin monitoring
+
+The public portal at `http://192.168.4.1/` is the page clients see. It stays limited to the lab tools: status of the board, the join QR code, the nearby-network scan, and the local form. It does not list other devices, their IP or MAC addresses, their HTTP headers, or DNS lookups, and it does not link to the monitoring page. A person using only `/` cannot open another client's record.
+
+Monitoring is a separate page, `http://192.168.4.1/admin`. The firmware protects that page, and the log and client routes behind it, with HTTP Basic Authentication. The browser asks for a username and password before the page loads. Those values are not published here. Set them in `ESP32_Educational_WiFi_Lab/config.h` before you flash:
+
+- `LAB_ADMIN_USER`
+- `LAB_ADMIN_PASSWORD` (8 to 63 characters)
+
+Change both for any real session. Treat the copies in `config.h` as local settings, not as passwords to leave in a shared document.
+
+After a device joins this access point and talks to the board, `/admin` can show:
+
+- A live console of recent joins, page requests, and DNS names, with text and JSON export of that short log.
+- One row per joined device: its IP address, MAC address, last page, Host, User-Agent, Accept-Language, and the DNS names it asked this board to resolve.
+
+The same events are printed on the serial monitor at 115200 baud. Rebooting the board clears the in-memory client table.
 
 ## License
 

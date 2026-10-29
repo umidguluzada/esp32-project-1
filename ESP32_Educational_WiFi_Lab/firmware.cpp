@@ -24,6 +24,9 @@ static_assert(
     sizeof(LAB_AP_PASSWORD) == 1 || (sizeof(LAB_AP_PASSWORD) >= 9 && sizeof(LAB_AP_PASSWORD) <= 64),
     "LAB_AP_PASSWORD must be empty (open network) or 8 to 63 characters");
 static_assert(LAB_AP_CHANNEL >= 1 && LAB_AP_CHANNEL <= 11, "Use an AP channel from 1 to 11");
+static_assert(sizeof(LAB_ADMIN_USER) >= 2, "LAB_ADMIN_USER is empty");
+static_assert(sizeof(LAB_ADMIN_PASSWORD) >= 9 && sizeof(LAB_ADMIN_PASSWORD) <= 64,
+              "LAB_ADMIN_PASSWORD must be 8 to 63 characters");
 static_assert(LAB_AP_MAX_CLIENTS >= 1 && LAB_AP_MAX_CLIENTS <= 10, "Max clients must be 1..10");
 static_assert(LAB_NAME_MAX >= 1 && LAB_NAME_MAX <= 64, "LAB_NAME_MAX is out of range");
 static_assert(LAB_NOTE_MAX >= 1 && LAB_NOTE_MAX <= 160, "LAB_NOTE_MAX is out of range");
@@ -75,6 +78,7 @@ static bool apReady = false;
 static char gMac[18] = "00:00:00:00:00:00";
 static char gIpText[16] = "0.0.0.0";
 static char gPortalLocation[40] = "http://192.168.4.1/";
+static char gWifiQr[220] = "";
 static char gJson[4096];
 
 // DHCP reports the MAC and local IP before the browser sends a User-Agent.
@@ -83,11 +87,33 @@ struct JoinedClient {
   bool active;
   uint8_t mac[6];
   uint8_t ip[4];
+  char path[48];
+  char userAgent[120];
+  char acceptLanguage[48];
+  char host[48];
+  char dns[4][64];
+  uint8_t dnsCount;
+  uint8_t dnsNext;
 };
 
 static JoinedClient joinedClients[LAB_AP_MAX_CLIENTS];
 static uint32_t dnsQueryCount = 0;
 static char dnsLastHost[96] = "";
+static char dnsLoggedHost[96] = "";
+
+// Recent lines for the password-protected admin page. The public portal does not read this.
+static const int kLogLines = 20;
+static const int kLogChars = 88;
+
+struct SessionLine {
+  uint32_t id;
+  char text[kLogChars];
+};
+
+static SessionLine sessionLog[kLogLines];
+static uint8_t sessionLogNext = 0;
+static uint8_t sessionLogCount = 0;
+static uint32_t sessionLogSeq = 0;
 
 static void jwInit(JsonWriter& writer, char* buf, size_t cap) {
   writer.buf = buf;
@@ -212,6 +238,35 @@ static uint32_t scanAgeSeconds() {
   return (millis() - scanFinishedAt) / 1000UL;
 }
 
+static void appendQrPiece(char* out, size_t cap, size_t* used, const char* src, bool escape) {
+  if (src == nullptr) {
+    return;
+  }
+  for (; *src != '\0' && *used + 2 < cap; ++src) {
+    if (escape && (*src == '\\' || *src == ';' || *src == ',' || *src == ':' || *src == '"')) {
+      out[(*used)++] = '\\';
+    }
+    if (*used + 1 >= cap) {
+      break;
+    }
+    out[(*used)++] = *src;
+  }
+  out[*used] = '\0';
+}
+
+static void buildWifiQrText() {
+  size_t n = 0;
+  gWifiQr[0] = '\0';
+  const bool open = LAB_AP_PASSWORD[0] == '\0';
+  appendQrPiece(gWifiQr, sizeof(gWifiQr), &n, open ? "WIFI:T:nop;S:" : "WIFI:T:WPA;S:", false);
+  appendQrPiece(gWifiQr, sizeof(gWifiQr), &n, LAB_AP_SSID, true);
+  if (!open) {
+    appendQrPiece(gWifiQr, sizeof(gWifiQr), &n, ";P:", false);
+    appendQrPiece(gWifiQr, sizeof(gWifiQr), &n, LAB_AP_PASSWORD, true);
+  }
+  appendQrPiece(gWifiQr, sizeof(gWifiQr), &n, ";;", false);
+}
+
 static void cacheIdentity() {
   uint8_t mac[6] = {0};
   WiFi.softAPmacAddress(mac);
@@ -221,6 +276,7 @@ static void cacheIdentity() {
   const IPAddress ip = WiFi.softAPIP();
   snprintf(gIpText, sizeof(gIpText), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
   snprintf(gPortalLocation, sizeof(gPortalLocation), "http://%s/", gIpText);
+  buildWifiQrText();
 }
 
 static void applyLed() {
@@ -337,26 +393,154 @@ static void formatIpv4(uint32_t addr, char* out, size_t cap) {
   snprintf(out, cap, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
 }
 
-static void rememberJoinedClient(const uint8_t mac[6], const IPAddress& ip) {
-  int freeSlot = -1;
+static bool sameClientIp(const JoinedClient& client, const IPAddress& ip) {
+  return client.ip[0] == ip[0] && client.ip[1] == ip[1] && client.ip[2] == ip[2] && client.ip[3] == ip[3];
+}
+
+static bool macIsBlank(const uint8_t mac[6]) {
+  for (int i = 0; i < 6; ++i) {
+    if (mac[i] != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void clearCaptured(JoinedClient& client) {
+  client.path[0] = '\0';
+  client.userAgent[0] = '\0';
+  client.acceptLanguage[0] = '\0';
+  client.host[0] = '\0';
+  client.dnsCount = 0;
+  client.dnsNext = 0;
+  for (int i = 0; i < 4; ++i) {
+    client.dns[i][0] = '\0';
+  }
+}
+
+static void copyLimited(char* dest, size_t cap, const char* src) {
+  size_t n = 0;
+  if (cap == 0) {
+    return;
+  }
+  if (src != nullptr) {
+    for (; src[n] != '\0' && n + 1 < cap; ++n) {
+      const unsigned char c = static_cast<unsigned char>(src[n]);
+      dest[n] = (c < 0x20 || c == 0x7F) ? ' ' : static_cast<char>(c);
+    }
+  }
+  dest[n] = '\0';
+}
+
+static int findClientByMac(const uint8_t mac[6]) {
+  if (macIsBlank(mac)) {
+    return -1;
+  }
   for (int i = 0; i < LAB_AP_MAX_CLIENTS; ++i) {
     if (joinedClients[i].active && memcmp(joinedClients[i].mac, mac, 6) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static int findClientByIp(const IPAddress& ip) {
+  for (int i = 0; i < LAB_AP_MAX_CLIENTS; ++i) {
+    if (joinedClients[i].active && sameClientIp(joinedClients[i], ip)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static int takeClientSlot(const uint8_t* mac, const IPAddress& ip) {
+  if (mac != nullptr) {
+    const int byMac = findClientByMac(mac);
+    if (byMac >= 0) {
       for (int b = 0; b < 4; ++b) {
-        joinedClients[i].ip[b] = ip[b];
+        joinedClients[byMac].ip[b] = ip[b];
       }
+      return byMac;
+    }
+  }
+  const int byIp = findClientByIp(ip);
+  if (byIp >= 0) {
+    if (mac != nullptr && !macIsBlank(mac)) {
+      memcpy(joinedClients[byIp].mac, mac, 6);
+    }
+    return byIp;
+  }
+  int slot = -1;
+  for (int i = 0; i < LAB_AP_MAX_CLIENTS; ++i) {
+    if (!joinedClients[i].active) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot < 0) {
+    slot = 0;
+  }
+  joinedClients[slot].active = true;
+  if (mac != nullptr) {
+    memcpy(joinedClients[slot].mac, mac, 6);
+  } else {
+    memset(joinedClients[slot].mac, 0, 6);
+  }
+  for (int b = 0; b < 4; ++b) {
+    joinedClients[slot].ip[b] = ip[b];
+  }
+  clearCaptured(joinedClients[slot]);
+  return slot;
+}
+
+static void rememberJoinedClient(const uint8_t mac[6], const IPAddress& ip) {
+  takeClientSlot(mac, ip);
+}
+
+static void noteClientDns(const IPAddress& ip, const char* host) {
+  if (host == nullptr || host[0] == '\0') {
+    return;
+  }
+  const int index = takeClientSlot(nullptr, ip);
+  JoinedClient& client = joinedClients[index];
+  if (client.dnsCount > 0) {
+    const int prev = (client.dnsNext == 0 ? 4 : client.dnsNext) - 1;
+    if (strcmp(client.dns[prev], host) == 0) {
       return;
     }
-    if (!joinedClients[i].active && freeSlot < 0) {
-      freeSlot = i;
-    }
   }
-  if (freeSlot < 0) {
-    freeSlot = 0;
+  copyLimited(client.dns[client.dnsNext], sizeof(client.dns[client.dnsNext]), host);
+  client.dnsNext = static_cast<uint8_t>((client.dnsNext + 1) % 4);
+  if (client.dnsCount < 4) {
+    ++client.dnsCount;
   }
-  joinedClients[freeSlot].active = true;
-  memcpy(joinedClients[freeSlot].mac, mac, 6);
-  for (int b = 0; b < 4; ++b) {
-    joinedClients[freeSlot].ip[b] = ip[b];
+}
+
+static void captureClientHttp() {
+  const IPAddress ip = webServer.client().remoteIP();
+  if (ip[0] == 0) {
+    return;
+  }
+  const int index = takeClientSlot(nullptr, ip);
+  JoinedClient& client = joinedClients[index];
+  const String uri = webServer.uri();
+  const bool poll = uri.startsWith("/api/status") || uri.startsWith("/api/clients") ||
+                    uri.startsWith("/api/log") || uri.startsWith("/api/headers") ||
+                    uri.startsWith("/api/scan");
+  if (!poll) {
+    copyLimited(client.path, sizeof(client.path), uri.c_str());
+  }
+  const String agent = webServer.header("User-Agent");
+  if (agent.length() > 0) {
+    copyLimited(client.userAgent, sizeof(client.userAgent), agent.c_str());
+  }
+  const String language = webServer.header("Accept-Language");
+  if (language.length() > 0) {
+    copyLimited(client.acceptLanguage, sizeof(client.acceptLanguage), language.c_str());
+  }
+  const String host = webServer.hostHeader();
+  if (host.length() > 0) {
+    copyLimited(client.host, sizeof(client.host), host.c_str());
   }
 }
 
@@ -388,6 +572,23 @@ static bool macForClientIp(const IPAddress& ip, uint8_t mac[6]) {
   return false;
 }
 
+static void pushLog(const char* text) {
+  SessionLine& line = sessionLog[sessionLogNext];
+  sessionLogNext = static_cast<uint8_t>((sessionLogNext + 1) % kLogLines);
+  if (sessionLogCount < kLogLines) {
+    ++sessionLogCount;
+  }
+  line.id = ++sessionLogSeq;
+  size_t n = 0;
+  if (text != nullptr) {
+    for (; text[n] != '\0' && n + 1 < static_cast<size_t>(kLogChars); ++n) {
+      const unsigned char c = static_cast<unsigned char>(text[n]);
+      line.text[n] = (c < 0x20 || c == 0x7F) ? ' ' : static_cast<char>(c);
+    }
+  }
+  line.text[n] = '\0';
+}
+
 static void onApEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   char stamp[24];
   formatBootTime(stamp, sizeof(stamp));
@@ -409,8 +610,14 @@ static void onApEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       char mac[18];
       formatMac(info.wifi_ap_staipassigned.mac, mac, sizeof(mac));
       Serial.printf("[ap] client connected  time=%s  ip=%s  mac=%s\n", stamp, ip, mac);
+      char note[kLogChars];
+      snprintf(note, sizeof(note), "%s joined %s %s", stamp, ip, mac);
+      pushLog(note);
 #else
       Serial.printf("[ap] client connected  time=%s  ip=%s\n", stamp, ip);
+      char note[kLogChars];
+      snprintf(note, sizeof(note), "%s joined %s", stamp, ip);
+      pushLog(note);
 #endif
       break;
     }
@@ -419,6 +626,9 @@ static void onApEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       char mac[18];
       formatMac(info.wifi_ap_stadisconnected.mac, mac, sizeof(mac));
       Serial.printf("[ap] client left  time=%s  mac=%s\n", stamp, mac);
+      char note[kLogChars];
+      snprintf(note, sizeof(note), "%s left %s", stamp, mac);
+      pushLog(note);
       break;
     }
     default:
@@ -647,11 +857,10 @@ static void sendStatusJson() {
   JsonWriter writer;
   jwInit(writer, gJson, sizeof(gJson));
   jwFmt(writer,
-        "{\"heap\":%u,\"minHeap\":%u,\"uptime\":%lu,\"clients\":%u,\"apChannel\":%u,\"led\":%d,\"scan\":\"%s\",\"ip\":\"%s\",\"mac\":\"%s\",\"ssid\":\"",
+        "{\"heap\":%u,\"minHeap\":%u,\"uptime\":%lu,\"apChannel\":%u,\"led\":%d,\"scan\":\"%s\",\"ip\":\"%s\",\"mac\":\"%s\",\"ssid\":\"",
         static_cast<unsigned>(ESP.getFreeHeap()),
         static_cast<unsigned>(ESP.getMinFreeHeap()),
         static_cast<unsigned long>(millis() / 1000UL),
-        static_cast<unsigned>(WiFi.softAPgetStationNum()),
         static_cast<unsigned>(LAB_AP_CHANNEL),
         cfg.ledOn ? 1 : 0,
         scanStateName(),
@@ -662,8 +871,8 @@ static void sendStatusJson() {
   jwEsc(writer, cfg.deviceName);
   jwAdd(writer, "\",\"labNote\":\"");
   jwEsc(writer, cfg.labNote);
-  jwFmt(writer, "\",\"dnsQueries\":%lu,\"dnsLast\":\"", static_cast<unsigned long>(dnsQueryCount));
-  jwEsc(writer, dnsLastHost);
+  jwAdd(writer, "\",\"qr\":\"");
+  jwEsc(writer, gWifiQr);
   jwAdd(writer, "\"}");
   sendWriter(200, writer, "{\"error\":\"status unavailable\"}");
 }
@@ -685,6 +894,9 @@ static void logPortalGet() {
   // Printed before the page is sent. The User-Agent exists only on this request.
   Serial.printf("[portal] get  time=%s  ip=%s  mac=%s\n", stamp, ipText, macText);
   Serial.printf("[portal] user-agent=%s\n", userAgent.length() > 0 ? userAgent.c_str() : "(none)");
+  char note[kLogChars];
+  snprintf(note, sizeof(note), "%s GET / %s %s", stamp, ipText, macText);
+  pushLog(note);
 }
 
 static void handleRoot() {
@@ -717,6 +929,15 @@ static void handleScanGet() {
 }
 
 static void handleScanPost() {
+  char ipText[16];
+  char stamp[24];
+  const IPAddress ip = webServer.client().remoteIP();
+  snprintf(ipText, sizeof(ipText), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+  formatBootTime(stamp, sizeof(stamp));
+  Serial.printf("[scan] request  time=%s  ip=%s\n", stamp, ipText);
+  char note[kLogChars];
+  snprintf(note, sizeof(note), "%s POST /api/scan %s", stamp, ipText);
+  pushLog(note);
   startScan();
   sendScanJson();
 }
@@ -740,6 +961,14 @@ static void logFormSubmission() {
 static void handleConfigPost() {
   // Print the post as soon as it arrives, before the values are stored.
   logFormSubmission();
+  char note[kLogChars];
+  char stamp[24];
+  char ipText[16];
+  const IPAddress ip = webServer.client().remoteIP();
+  snprintf(ipText, sizeof(ipText), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+  formatBootTime(stamp, sizeof(stamp));
+  snprintf(note, sizeof(note), "%s POST /api/config %s fields=%d", stamp, ipText, webServer.args());
+  pushLog(note);
 
   if (webServer.hasArg("clear") && webServer.arg("clear") == "1") {
     resetConfig();
@@ -800,13 +1029,36 @@ static void sendClientsJson() {
              joinedClients[i].ip[0], joinedClients[i].ip[1],
              joinedClients[i].ip[2], joinedClients[i].ip[3]);
     formatMac(joinedClients[i].mac, macText, sizeof(macText));
-    jwFmt(writer, "{\"ip\":\"%s\",\"mac\":\"%s\"}", ipText, macText);
+    jwFmt(writer, "{\"ip\":\"%s\",\"mac\":\"%s\",\"path\":\"", ipText, macIsBlank(joinedClients[i].mac) ? "unknown" : macText);
+    jwEsc(writer, joinedClients[i].path);
+    jwAdd(writer, "\",\"userAgent\":\"");
+    jwEsc(writer, joinedClients[i].userAgent);
+    jwAdd(writer, "\",\"acceptLanguage\":\"");
+    jwEsc(writer, joinedClients[i].acceptLanguage);
+    jwAdd(writer, "\",\"host\":\"");
+    jwEsc(writer, joinedClients[i].host);
+    jwAdd(writer, "\",\"dns\":[");
+    const int dnsStart = (joinedClients[i].dnsCount < 4) ? 0 : joinedClients[i].dnsNext;
+    for (int d = 0; d < joinedClients[i].dnsCount; ++d) {
+      if (d > 0) {
+        jwAdd(writer, ",");
+      }
+      jwAdd(writer, "\"");
+      jwEsc(writer, joinedClients[i].dns[(dnsStart + d) % 4]);
+      jwAdd(writer, "\"");
+    }
+    jwAdd(writer, "]}");
   }
   jwAdd(writer, "]}");
   sendWriter(200, writer, "{\"count\":0,\"clients\":[]}");
 }
 
+static bool requireAdmin();
+
 static void handleClients() {
+  if (!requireAdmin()) {
+    return;
+  }
   sendClientsJson();
 }
 
@@ -840,6 +1092,9 @@ static void sendHeadersJson() {
 }
 
 static void handleHeaders() {
+  if (!requireAdmin()) {
+    return;
+  }
   sendHeadersJson();
 }
 
@@ -978,6 +1233,17 @@ static void pollDns() {
                   static_cast<unsigned long>(dnsQueryCount),
                   from[0], from[1], from[2], from[3],
                   dnsLastHost);
+    noteClientDns(from, dnsLastHost);
+    if (strcmp(dnsLoggedHost, dnsLastHost) != 0) {
+      strncpy(dnsLoggedHost, dnsLastHost, sizeof(dnsLoggedHost) - 1);
+      dnsLoggedHost[sizeof(dnsLoggedHost) - 1] = '\0';
+      char stamp[24];
+      char note[kLogChars];
+      formatBootTime(stamp, sizeof(stamp));
+      snprintf(note, sizeof(note), "%s DNS %u.%u.%u.%u %s",
+               stamp, from[0], from[1], from[2], from[3], dnsLastHost);
+      pushLog(note);
+    }
 
     const uint16_t questions = (static_cast<uint16_t>(buf[4]) << 8) | buf[5];
     if (questions != 1) {
@@ -1004,6 +1270,68 @@ static void pollDns() {
   }
 }
 
+static bool requireAdmin() {
+  if (webServer.authenticate(LAB_ADMIN_USER, LAB_ADMIN_PASSWORD)) {
+    return true;
+  }
+  webServer.requestAuthentication(BASIC_AUTH, "ESP32 Lab Admin", "Admin login required");
+  return false;
+}
+
+static void handleAdmin() {
+  if (!requireAdmin()) {
+    return;
+  }
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send_P(200, "text/html; charset=utf-8", ADMIN_HTML);
+}
+
+static void fillSessionLog(JsonWriter& writer) {
+  jwInit(writer, gJson, sizeof(gJson));
+  jwFmt(writer, "{\"count\":%u,\"lines\":[", static_cast<unsigned>(sessionLogCount));
+  const int start = (sessionLogCount < kLogLines) ? 0 : sessionLogNext;
+  for (int i = 0; i < sessionLogCount; ++i) {
+    const SessionLine& line = sessionLog[(start + i) % kLogLines];
+    if (i > 0) {
+      jwAdd(writer, ",");
+    }
+    jwFmt(writer, "{\"id\":%lu,\"text\":\"", static_cast<unsigned long>(line.id));
+    jwEsc(writer, line.text);
+    jwAdd(writer, "\"}");
+  }
+  jwAdd(writer, "]}");
+}
+
+static void handleLog() {
+  if (!requireAdmin()) {
+    return;
+  }
+  const bool download = webServer.hasArg("dl");
+  const bool asText = download && webServer.arg("dl") == "txt";
+  if (asText) {
+    size_t n = 0;
+    gJson[0] = '\0';
+    const int start = (sessionLogCount < kLogLines) ? 0 : sessionLogNext;
+    for (int i = 0; i < sessionLogCount; ++i) {
+      const SessionLine& line = sessionLog[(start + i) % kLogLines];
+      const int wrote = snprintf(gJson + n, sizeof(gJson) - n, "%s\n", line.text);
+      if (wrote < 0 || static_cast<size_t>(wrote) >= sizeof(gJson) - n) {
+        break;
+      }
+      n += static_cast<size_t>(wrote);
+    }
+    webServer.sendHeader("Content-Disposition", "attachment; filename=\"esp32-session-log.txt\"");
+    webServer.send(200, "text/plain; charset=utf-8", gJson);
+    return;
+  }
+  JsonWriter writer;
+  fillSessionLog(writer);
+  if (download) {
+    webServer.sendHeader("Content-Disposition", "attachment; filename=\"esp32-session-log.json\"");
+  }
+  sendWriter(200, writer, "{\"count\":0,\"lines\":[]}");
+}
+
 static void registerRoutes() {
   static const char* kProbePaths[] = {
       "/generate_204",
@@ -1027,11 +1355,19 @@ static void registerRoutes() {
   };
   webServer.collectHeaders(kRequestHeaders, sizeof(kRequestHeaders) / sizeof(kRequestHeaders[0]));
 
+  webServer.addMiddleware([](WebServer& server, Middleware::Callback next) -> bool {
+    (void)server;
+    captureClientHttp();
+    return next();
+  });
+
   webServer.on("/", HTTP_GET, handleRoot);
+  webServer.on("/admin", HTTP_GET, handleAdmin);
   webServer.on("/favicon.ico", HTTP_GET, handleFavicon);
   webServer.on("/api/status", HTTP_GET, handleStatus);
   webServer.on("/api/clients", HTTP_GET, handleClients);
   webServer.on("/api/headers", HTTP_GET, handleHeaders);
+  webServer.on("/api/log", HTTP_GET, handleLog);
   webServer.on("/api/scan", HTTP_GET, handleScanGet);
   webServer.on("/api/scan", HTTP_POST, handleScanPost);
   webServer.on("/api/config", HTTP_GET, handleConfigGet);
@@ -1088,6 +1424,7 @@ void labSetup() {
   Serial.printf("SSID:       %s\n", LAB_AP_SSID);
   Serial.printf("Password:   %s\n", LAB_AP_PASSWORD[0] == '\0' ? "(none, open network)" : LAB_AP_PASSWORD);
   Serial.printf("Dashboard:  %s\n", gPortalLocation);
+  Serial.printf("Admin:      %sadmin\n", gPortalLocation);
   Serial.printf("Channel:    %u\n", static_cast<unsigned>(LAB_AP_CHANNEL));
   Serial.printf("MAC:        %s\n", gMac);
   Serial.println("----------------------------------------");

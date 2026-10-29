@@ -13,6 +13,16 @@
 #define LAB_AP_PASSWORD ""
 #endif
 
+// Browser login for /admin only. The main portal does not link to that page.
+// The password must be 8 to 63 characters.
+#ifndef LAB_ADMIN_USER
+#define LAB_ADMIN_USER "admin"
+#endif
+
+#ifndef LAB_ADMIN_PASSWORD
+#define LAB_ADMIN_PASSWORD "edulab-admin"
+#endif
+
 // Channels 1, 6, and 11 do not overlap. 1-11 is valid in every region.
 #ifndef LAB_AP_CHANNEL
 #define LAB_AP_CHANNEL 6
